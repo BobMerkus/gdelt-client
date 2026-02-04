@@ -1,8 +1,10 @@
-# GDELT 2.0 Doc API Client
+# GDELT 2.0 API Client
 
-A Python client to fetch data from the [GDELT 2.0 Doc API](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/).
+A Python client to fetch data from the [GDELT 2.0 API](https://gdeltproject.org/).
 
 This allows for simpler, small-scale analysis of news coverage without having to deal with the complexities of downloading and managing the raw files from S3, or working with the BigQuery export.
+
+The implementation has been forked from [gdeltdoc](https://github.com/alex9smith/gdelt-doc-api).
 
 ## Installation
 
@@ -17,7 +19,7 @@ pip install gdeltdoc
 The `ArtList` and `Timeline*` query modes are supported.
 
 ```python
-from gdeltdoc import GdeltDoc, Filters
+from gdeltdoc import GdeltClient, Filters
 
 f = Filters(
     keyword = "climate change",
@@ -25,7 +27,7 @@ f = Filters(
     end_date = "2020-05-11"
 )
 
-gd = GdeltDoc()
+gd = GdeltClient()
 
 # Search for articles matching the filters
 articles = gd.article_search(f)
@@ -88,34 +90,22 @@ You must pass either `start_date` and `end_date`, or `timespan`
 - `tone` - Return articles above or below a particular tone score (ie more positive or more negative than a certain threshold). To use, specify either a greater than or less than sign and a positive or negative number (either an integer or floating point number). To find fairly positive articles, use `tone=">5"` or to search for fairly negative articles, use `tone="<-5"`
 - tone_absolute - The same as `tone` but ignores the positive/negative sign and lets you search for high emotion or low emotion articles, regardless of whether they were happy or sad in tone
 
-## Developing gdelt-doc-api
+## Developing gdelt-client
 
 PRs & issues are very welcome!
 
 ### Setup
 
-It's recommended to use a virtual environment for development. Set one up with
+It's recommended to use a virtual environment for development. Set one up with [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 ```
-python -m venv venv
+uv sync
 ```
 
-and activate it (on Mac or Linux)
+Tests for this package use `pytest`. Run them with
 
 ```
-source venv/bin/activate
-```
-
-Then install the requirements
-
-```
-pip install -r requirements.txt
-```
-
-Tests for this package use `unittest`. Run them with
-
-```
-python -m unittest
+uv run pytest tests --cov=src/gdelt_client --cov-report=xml --cov-report=term-missing
 ```
 
 If your PR adds a new feature or helper, please also add some tests

@@ -1,15 +1,9 @@
-from typing import Optional, List, Union, Tuple
-
-try:
-    from typing import Unpack
-except ImportError:
-    from typing_extensions import Unpack
-
 from string import ascii_lowercase, digits
-from gdeltdoc.validation import validate_tone
-from gdeltdoc.helpers import Date, format_date
 
-Filter = Union[List[str], str]
+from gdelt_client.helpers import Date, format_date
+from gdelt_client.validation import validate_tone
+
+Filter = list[str] | str
 
 
 VALID_TIMESPAN_UNITS = ["min", "h", "hours", "d", "days", "w", "weeks", "m", "months"]
@@ -26,12 +20,10 @@ def near(n: int, *args) -> str:
     if len(args) < 2:
         raise ValueError("At least two words must be provided")
 
-    return f"near{str(n)}:" + '"' + " ".join([a for a in args]) + '" '
+    return f"near{n!s}:" + '"' + " ".join(list(args)) + '" '
 
 
-def multi_near(
-    nears: List[Tuple[int, Unpack[Tuple[str, ...]]]], method: str = "OR"
-) -> str:
+def multi_near(nears: list[tuple[int, *tuple[str, ...]]], method: str = "OR") -> str:
     """
     Build the filter to find articles containing multiple sets of near terms.
 
@@ -61,10 +53,10 @@ def repeat(n: int, keyword: str) -> str:
     if " " in keyword:
         raise ValueError("Only single words can be repeated")
 
-    return f'repeat{str(n)}:"{keyword}" '
+    return f'repeat{n!s}:"{keyword}" '
 
 
-def multi_repeat(repeats: List[Tuple[int, str]], method: str) -> str:
+def multi_repeat(repeats: list[tuple[int, str]], method: str) -> str:
     """
     Build the filter to find articles containing multiple repeated words using `repeat()`
 
@@ -89,23 +81,22 @@ def multi_repeat(repeats: List[Tuple[int, str]], method: str) -> str:
 
 
 class Filters:
-
-    def __init__(
+    def __init__(  # noqa: C901
         self,
-        start_date: Optional[Date] = None,
-        end_date: Optional[Date] = None,
-        timespan: Optional[str] = None,
+        start_date: Date | None = None,
+        end_date: Date | None = None,
+        timespan: str | None = None,
         num_records: int = 250,
-        keyword: Optional[Filter] = None,
-        domain: Optional[Filter] = None,
-        domain_exact: Optional[Filter] = None,
-        near: Optional[str] = None,
-        repeat: Optional[str] = None,
-        country: Optional[Filter] = None,
-        language: Optional[Filter] = None,
-        theme: Optional[Filter] = None,
-        tone: Optional[Filter] = None,
-        tone_absolute: Optional[Filter] = None,
+        keyword: Filter | None = None,
+        domain: Filter | None = None,
+        domain_exact: Filter | None = None,
+        near: str | None = None,
+        repeat: str | None = None,
+        country: Filter | None = None,
+        language: Filter | None = None,
+        theme: Filter | None = None,
+        tone: Filter | None = None,
+        tone_absolute: Filter | None = None,
     ) -> None:
         """
         Construct filters for the GDELT API.
@@ -185,18 +176,16 @@ class Filters:
             The same as `tone` but ignores the positive/negative sign and lets you simply search for
             high emotion or low emotion articles, regardless of whether they were happy or sad in tone
         """
-        self.query_params: List[str] = []
-        self._valid_countries: List[str] = []
-        self._valid_themes: List[str] = []
+        self.query_params: list[str] = []
+        self._valid_countries: list[str] = []
+        self._valid_themes: list[str] = []
 
         # Check we have either start/end date or timespan, but not both
         if not start_date and not end_date and not timespan:
             raise ValueError("Must provide either start_date and end_date, or timespan")
 
         if start_date and end_date and timespan:
-            raise ValueError(
-                "Can only provide either start_date and end_date, or timespan"
-            )
+            raise ValueError("Can only provide either start_date and end_date, or timespan")
 
         if keyword:
             self.query_params.append(self._keyword_to_string(keyword))
@@ -244,7 +233,7 @@ class Filters:
         if num_records > 250:
             raise ValueError(f"num_records must 250 or less, not {num_records}")
 
-        self.query_params.append(f"&maxrecords={str(num_records)}")
+        self.query_params.append(f"&maxrecords={num_records!s}")
 
     @property
     def query_string(self) -> str:
@@ -268,7 +257,7 @@ class Filters:
         str
             The converted filter. Eg. "domain:cnn.com"
         """
-        if type(f) == str:
+        if type(f) is str:
             return f"{name}:{f} "
 
         else:
@@ -293,17 +282,11 @@ class Filters:
         str
             The converted filter eg. "(airline OR shipping)"
         """
-        if type(keywords) == str:
+        if type(keywords) is str:
             return f'"{keywords}" '
 
         else:
-            return (
-                "("
-                + " OR ".join(
-                    [f'"{word}"' if " " in word else word for word in keywords]
-                )
-                + ") "
-            )
+            return "(" + " OR ".join([f'"{word}"' if " " in word else word for word in keywords]) + ") "
 
     @staticmethod
     def _tone_to_string(name: str, tone: Filter) -> str:
@@ -324,7 +307,7 @@ class Filters:
         str
             The converted filter eg. "tone>5"
         """
-        if type(tone) == str:
+        if type(tone) is str:
             return f"{name}{tone} "
 
         else:
@@ -357,15 +340,12 @@ class Filters:
 
         if unit not in VALID_TIMESPAN_UNITS:
             raise ValueError(
-                f"Timespan {timespan} is invalid. {unit} is not a supported unit, must be one of {' '.join(VALID_TIMESPAN_UNITS)}"
+                f"Timespan {timespan} is invalid. {unit} is not a supported unit, \
+                must be one of {' '.join(VALID_TIMESPAN_UNITS)}"
             )
 
         if not all(d in digits for d in value):
-            raise ValueError(
-                f"Timespan {timespan} is invalid. {value} could not be converted into an integer"
-            )
+            raise ValueError(f"Timespan {timespan} is invalid. {value} could not be converted into an integer")
 
         if unit == "min" and int(value) < 60:
-            raise ValueError(
-                f"Timespan {timespan} is invalid. Period must be at least 60 minutes"
-            )
+            raise ValueError(f"Timespan {timespan} is invalid. Period must be at least 60 minutes")
