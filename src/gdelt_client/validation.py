@@ -1,6 +1,4 @@
-from typing import List, Union
-
-Filter = Union[List[str], str]
+Filter = list[str] | str
 
 
 def validate_tone(tone: Filter) -> None:
@@ -10,5 +8,5 @@ def validate_tone(tone: Filter) -> None:
     if "=" in tone:
         raise ValueError("Tone cannot contain '='")
 
-    if type(tone) == list:
+    if type(tone) is list:
         raise NotImplementedError("Multiple tones are not supported yet")
