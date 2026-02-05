@@ -4,7 +4,7 @@ from unittest import mock
 import pandas as pd
 import pytest
 from aiohttp import ClientSession
-from requests import Response, Session
+from requests import Response
 
 from gdelt_client import Filters, GdeltClient
 from gdelt_client.errors import RateLimitError
@@ -177,7 +177,7 @@ class TestQueryAsync:
     @pytest.mark.asyncio
     async def test_raises_an_error_when_response_is_bad_status_code(self):
         async with ClientSession() as session:
-            gd = GdeltClient(aio_session=session)
+            gd = GdeltClient(aio_session=session, max_retries=0)
 
             mock_response = mock.AsyncMock()
             mock_response.status = 429
@@ -340,15 +340,19 @@ class TestQuerySync:
             gd._query("artlist", "environment&timespan=mins15")
 
     def test_raises_an_error_when_response_is_bad_status_code(self):
-        gd = GdeltClient(session=Session())
+        # Disable retries since this test only verifies that RateLimitError is raised
+        gd = GdeltClient(max_retries=0)
 
         mock_response = mock.Mock(spec=Response)
         mock_response.status_code = 429
         mock_response.reason = "Too Many Requests"
         mock_response.headers = {"content-type": "application/json"}
 
-        with mock.patch.object(gd.session, "get") as mock_get:
-            mock_get.return_value = mock_response
+        with mock.patch("gdelt_client.api_client.Session") as mock_session_class:
+            mock_session = mock.Mock()
+            mock_session.get.return_value = mock_response
+            mock_session_class.return_value = mock_session
+
             with pytest.raises(RateLimitError):
                 gd._query("artlist", "")
 
@@ -1049,3 +1053,267 @@ class TestDefaultMatchCase:
             result = client._format_output(df, OutputFormat.DATAFRAME, normalize_columns=False)
 
         assert isinstance(result, pd.DataFrame)
+
+
+def _get_fast_retry_kwargs(client):
+    """Helper to get retry kwargs with wait_none for fast tests."""
+    from aiohttp import ClientConnectionError
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from tenacity import retry_if_exception_type, stop_after_attempt, wait_none
+
+    from gdelt_client.errors import RateLimitError, ServerError
+
+    return {
+        "stop": stop_after_attempt(client.max_retries + 1),
+        "wait": wait_none(),
+        "retry": retry_if_exception_type((RateLimitError, ServerError, RequestsConnectionError, ClientConnectionError)),
+        "reraise": True,
+    }
+
+
+class TestRetryBehaviorSync:
+    """Test retry behavior for synchronous API calls."""
+
+    def test_query_retries_on_rate_limit(self):
+        """Test that _query retries on 429 rate limit errors."""
+        client = GdeltClient(max_retries=3, retry_backoff_base=2)
+
+        mock_response_fail = mock.Mock(spec=Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.reason = "Too Many Requests"
+
+        mock_response_success = mock.Mock(spec=Response)
+        mock_response_success.status_code = 200
+        mock_response_success.headers = {"content-type": "application/json"}
+        mock_response_success.content = b'{"articles": []}'
+
+        with (
+            mock.patch("gdelt_client.api_client.Session") as mock_session_class,
+            mock.patch.object(client, "_get_retry_kwargs", lambda wait=None: _get_fast_retry_kwargs(client)),
+        ):
+            mock_session = mock.Mock()
+            mock_session.get.side_effect = [
+                mock_response_fail,
+                mock_response_fail,
+                mock_response_success,
+            ]
+            mock_session_class.return_value = mock_session
+
+            result = client._query("artlist", "test")
+
+            assert result == {"articles": []}
+            assert mock_session.get.call_count == 3
+
+    def test_query_exhausts_retries_on_rate_limit(self):
+        """Test that _query raises error after exhausting retries."""
+        client = GdeltClient(max_retries=2, retry_backoff_base=2)
+
+        mock_response_fail = mock.Mock(spec=Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.reason = "Too Many Requests"
+
+        with (
+            mock.patch("gdelt_client.api_client.Session") as mock_session_class,
+            mock.patch.object(client, "_get_retry_kwargs", lambda wait=None: _get_fast_retry_kwargs(client)),
+            pytest.raises(RateLimitError),
+        ):
+            mock_session = mock.Mock()
+            mock_session.get.return_value = mock_response_fail
+            mock_session_class.return_value = mock_session
+
+            client._query("artlist", "test")
+
+    def test_query_retries_on_server_error(self):
+        """Test that _query retries on 5XX server errors."""
+        client = GdeltClient(max_retries=3, retry_backoff_base=2)
+
+        mock_response_fail = mock.Mock(spec=Response)
+        mock_response_fail.status_code = 503
+        mock_response_fail.reason = "Service Unavailable"
+
+        mock_response_success = mock.Mock(spec=Response)
+        mock_response_success.status_code = 200
+        mock_response_success.headers = {"content-type": "application/json"}
+        mock_response_success.content = b'{"articles": []}'
+
+        with (
+            mock.patch("gdelt_client.api_client.Session") as mock_session_class,
+            mock.patch.object(client, "_get_retry_kwargs", lambda wait=None: _get_fast_retry_kwargs(client)),
+        ):
+            mock_session = mock.Mock()
+            mock_session.get.side_effect = [mock_response_fail, mock_response_success]
+            mock_session_class.return_value = mock_session
+
+            result = client._query("artlist", "test")
+
+            assert result == {"articles": []}
+            assert mock_session.get.call_count == 2
+
+    def test_query_no_retry_when_disabled(self):
+        """Test that _query doesn't retry when max_retries=0."""
+        client = GdeltClient(max_retries=0)
+
+        mock_response_fail = mock.Mock(spec=Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.reason = "Too Many Requests"
+
+        with (
+            mock.patch("gdelt_client.api_client.Session") as mock_session_class,
+            pytest.raises(RateLimitError),
+        ):
+            mock_session = mock.Mock()
+            mock_session.get.return_value = mock_response_fail
+            mock_session_class.return_value = mock_session
+
+            client._query("artlist", "test")
+
+            assert mock_session.get.call_count == 1
+
+    def test_download_retries_on_rate_limit(self):
+        """Test that _download_and_parse retries on 429 errors."""
+        from gdelt_client.enums import GdeltTable
+
+        client = GdeltClient(max_retries=2, retry_backoff_base=2)
+
+        mock_response_fail = mock.Mock(spec=Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.reason = "Too Many Requests"
+
+        mock_response_success = mock.Mock(spec=Response)
+        mock_response_success.status_code = 200
+        mock_response_success.content = b"mock_zip_content"
+
+        with (
+            mock.patch("gdelt_client.api_client.Session") as mock_session_class,
+            mock.patch.object(client, "_parse_gdelt_file", return_value=pd.DataFrame({"Col1": [1]})),
+            mock.patch.object(client, "_get_retry_kwargs", lambda wait=None: _get_fast_retry_kwargs(client)),
+        ):
+            mock_session = mock.Mock()
+            mock_session.get.side_effect = [mock_response_fail, mock_response_success]
+            mock_session_class.return_value = mock_session
+
+            result = client._download_and_parse("http://test.com/file.zip", GdeltTable.EVENTS, ["Col1"])
+
+            assert result is not None
+            assert mock_session.get.call_count == 2
+
+
+class TestRetryBehaviorAsync:
+    """Test retry behavior for asynchronous API calls."""
+
+    @pytest.mark.asyncio
+    async def test_aquery_retries_on_rate_limit(self):
+        """Test that _aquery retries on 429 rate limit errors."""
+        client = GdeltClient(max_retries=3, retry_backoff_base=2)
+
+        mock_response_fail = mock.MagicMock()
+        mock_response_fail.status = 429
+        mock_response_fail.reason = "Too Many Requests"
+
+        mock_response_success = mock.MagicMock()
+        mock_response_success.status = 200
+        mock_response_success.headers = {"content-type": "application/json"}
+        mock_response_success.read = mock.AsyncMock(return_value=b'{"articles": []}')
+        mock_response_success.release = mock.Mock()
+
+        async with ClientSession() as session:
+            client.aio_session = session
+
+            with (
+                mock.patch.object(session, "get", new_callable=mock.AsyncMock) as mock_get,
+                mock.patch.object(client, "_get_retry_kwargs", lambda wait=None: _get_fast_retry_kwargs(client)),
+            ):
+                mock_get.side_effect = [
+                    mock_response_fail,
+                    mock_response_fail,
+                    mock_response_success,
+                ]
+
+                result = await client._aquery("artlist", "test")
+
+                assert result == {"articles": []}
+                assert mock_get.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_aquery_exhausts_retries_on_rate_limit(self):
+        """Test that _aquery raises error after exhausting retries."""
+        client = GdeltClient(max_retries=2, retry_backoff_base=2)
+
+        mock_response_fail = mock.MagicMock()
+        mock_response_fail.status = 429
+        mock_response_fail.reason = "Too Many Requests"
+
+        async with ClientSession() as session:
+            client.aio_session = session
+
+            with (
+                mock.patch.object(session, "get", new_callable=mock.AsyncMock, return_value=mock_response_fail),
+                mock.patch.object(client, "_get_retry_kwargs", lambda wait=None: _get_fast_retry_kwargs(client)),
+                pytest.raises(RateLimitError),
+            ):
+                await client._aquery("artlist", "test")
+
+    @pytest.mark.asyncio
+    async def test_aquery_retries_on_server_error(self):
+        """Test that _aquery retries on 5XX server errors."""
+        client = GdeltClient(max_retries=3, retry_backoff_base=2)
+
+        mock_response_fail = mock.MagicMock()
+        mock_response_fail.status = 503
+        mock_response_fail.reason = "Service Unavailable"
+
+        mock_response_success = mock.MagicMock()
+        mock_response_success.status = 200
+        mock_response_success.headers = {"content-type": "application/json"}
+        mock_response_success.read = mock.AsyncMock(return_value=b'{"articles": []}')
+        mock_response_success.release = mock.Mock()
+
+        async with ClientSession() as session:
+            client.aio_session = session
+
+            with (
+                mock.patch.object(session, "get", new_callable=mock.AsyncMock) as mock_get,
+                mock.patch.object(client, "_get_retry_kwargs", lambda wait=None: _get_fast_retry_kwargs(client)),
+            ):
+                mock_get.side_effect = [mock_response_fail, mock_response_success]
+
+                result = await client._aquery("artlist", "test")
+
+                assert result == {"articles": []}
+                assert mock_get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_aquery_no_retry_when_disabled(self):
+        """Test that _aquery doesn't retry when max_retries=0."""
+        client = GdeltClient(max_retries=0)
+
+        mock_response_fail = mock.MagicMock()
+        mock_response_fail.status = 429
+        mock_response_fail.reason = "Too Many Requests"
+
+        async with ClientSession() as session:
+            client.aio_session = session
+
+            with (
+                mock.patch.object(session, "get", new_callable=mock.AsyncMock, return_value=mock_response_fail),
+                pytest.raises(RateLimitError),
+            ):
+                await client._aquery("artlist", "test")
+
+    @pytest.mark.asyncio
+    async def test_adownload_returns_none_after_retries_exhausted(self):
+        """Test that _adownload_and_parse returns None after exhausting retries on 429."""
+        from gdelt_client.enums import GdeltTable
+
+        client = GdeltClient(max_retries=2, retry_backoff_base=2)
+
+        async def mock_download(*args, **kwargs):
+            response = mock.Mock()
+            response.status = 429
+            response.reason = "Too Many Requests"
+            raise RateLimitError(response)
+
+        with mock.patch.object(client, "_aretry_with_logging", side_effect=mock_download):
+            result = await client._adownload_and_parse("http://test.com/file.zip", GdeltTable.EVENTS, ["Col1"])
+
+            assert result is None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -8,11 +9,19 @@ from io import BytesIO
 from typing import TYPE_CHECKING
 
 import pandas as pd
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientConnectionError, ClientSession, ClientTimeout
 from requests import Session
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from tenacity import (
+    AsyncRetrying,
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from gdelt_client.enums import ArticleMode, GdeltTable, Mode, OutputFormat, TimeSeriesMode
-from gdelt_client.errors import raise_response_error
+from gdelt_client.errors import RateLimitError, ServerError, raise_response_error
 from gdelt_client.filters import Filters
 from gdelt_client.helpers import (
     Date,
@@ -23,6 +32,8 @@ from gdelt_client.helpers import (
     load_schema,
 )
 from gdelt_client.validation import validate_date, validate_table
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import geopandas as gpd
@@ -108,6 +119,9 @@ class GdeltClient:
         max_workers: int | None = None,
         download_timeout: int = 120,
         max_concurrent_downloads: int = 20,
+        max_retries: int = 5,
+        retry_backoff_base: int = 2,
+        retry_max_wait: int = 60,
     ) -> None:
         """
         Initialize the GDELT client.
@@ -129,6 +143,15 @@ class GdeltClient:
         max_concurrent_downloads
             Maximum number of concurrent async downloads.
             Defaults to 20 to prevent overwhelming the network.
+        max_retries
+            Maximum number of retry attempts for failed requests due to rate limiting
+            or server errors. Defaults to 5. Set to 0 to disable retries.
+        retry_backoff_base
+            Base for exponential backoff calculation (base^retry_number seconds).
+            Defaults to 2 (waits: 1s, 2s, 4s, 8s, 16s, ...).
+        retry_max_wait
+            Maximum wait time in seconds between retries.
+            Defaults to 60 seconds.
         """
         self.max_depth_json_parsing = json_parsing_max_depth
         self.default_headers: dict[str, str] = {
@@ -139,6 +162,9 @@ class GdeltClient:
         self.max_workers = max_workers
         self.download_timeout = download_timeout
         self.max_concurrent_downloads = max_concurrent_downloads
+        self.max_retries = max_retries
+        self.retry_backoff_base = retry_backoff_base
+        self.retry_max_wait = retry_max_wait
         self._cameo_codes: pd.DataFrame | None = None
         # Track if sessions were provided by user (so we don't close them)
         self._user_provided_session = session is not None
@@ -163,6 +189,70 @@ class GdeltClient:
         if not self._user_provided_aio_session and self.aio_session is not None:
             await self.aio_session.close()
         return False
+
+    def _get_retry_kwargs(self, wait=None) -> dict:
+        """Get retry configuration kwargs for tenacity."""
+        if self.max_retries == 0:
+            return {}
+
+        return {
+            "stop": stop_after_attempt(self.max_retries + 1),
+            "wait": wait or wait_exponential(multiplier=1, min=self.retry_backoff_base, max=self.retry_max_wait),
+            "retry": retry_if_exception_type((RateLimitError, ServerError, RequestsConnectionError)),
+            "reraise": True,
+        }
+
+    def _get_async_retry_kwargs(self, wait=None) -> dict:
+        """Get retry configuration kwargs for tenacity (async version with aiohttp errors)."""
+        if self.max_retries == 0:
+            return {}
+
+        return {
+            "stop": stop_after_attempt(self.max_retries + 1),
+            "wait": wait or wait_exponential(multiplier=1, min=self.retry_backoff_base, max=self.retry_max_wait),
+            "retry": retry_if_exception_type((RateLimitError, ServerError, ClientConnectionError)),
+            "reraise": True,
+        }
+
+    def _retry_with_logging(self, func, *args, **kwargs):
+        """Execute function with retry logic and logging (sync)."""
+        retry_kwargs = self._get_retry_kwargs()
+        if not retry_kwargs:
+            return func(*args, **kwargs)
+
+        for attempt in Retrying(**retry_kwargs):
+            with attempt:
+                try:
+                    return func(*args, **kwargs)
+                except (RateLimitError, ServerError, RequestsConnectionError) as e:
+                    if attempt.retry_state.attempt_number > 1:
+                        wait_time = self.retry_backoff_base ** (attempt.retry_state.attempt_number - 1)
+                        wait_time = min(wait_time, self.retry_max_wait)
+                        logger.warning(
+                            f"Request failed with {type(e).__name__}, retrying in {wait_time}s "
+                            f"(attempt {attempt.retry_state.attempt_number}/{self.max_retries + 1})"
+                        )
+                    raise
+
+    async def _aretry_with_logging(self, func, *args, **kwargs):
+        """Execute async function with retry logic and logging."""
+        retry_kwargs = self._get_async_retry_kwargs()
+        if not retry_kwargs:
+            return await func(*args, **kwargs)
+
+        async for attempt in AsyncRetrying(**retry_kwargs):
+            with attempt:
+                try:
+                    return await func(*args, **kwargs)
+                except (RateLimitError, ServerError, ClientConnectionError) as e:
+                    if attempt.retry_state.attempt_number > 1:
+                        wait_time = self.retry_backoff_base ** (attempt.retry_state.attempt_number - 1)
+                        wait_time = min(wait_time, self.retry_max_wait)
+                        logger.warning(
+                            f"Request failed with {type(e).__name__}, retrying in {wait_time}s "
+                            f"(attempt {attempt.retry_state.attempt_number}/{self.max_retries + 1})"
+                        )
+                    raise
 
     @property
     def cameo_codes(self) -> pd.DataFrame:
@@ -211,20 +301,24 @@ class GdeltClient:
 
     def _query(self, mode: str | Mode, query_string: str) -> dict:
         """Execute a DOC API query (sync)."""
-        if self.session is None:
-            self.session = Session()
-            self.session.headers.update(self.default_headers)
 
-        response = self.session.get(
-            f"{self.DOC_API_URL}?query={query_string}&mode={mode}&format=json",
-        )
+        def _do_query():
+            if self.session is None:
+                self.session = Session()
+                self.session.headers.update(self.default_headers)
 
-        raise_response_error(response=response)
+            response = self.session.get(
+                f"{self.DOC_API_URL}?query={query_string}&mode={mode}&format=json",
+            )
 
-        if "text/html" in response.headers.get("content-type", ""):
-            raise ValueError(f"Invalid query. API error: {response.text.strip()}")
+            raise_response_error(response=response)
 
-        return load_json(response.content, self.max_depth_json_parsing)
+            if "text/html" in response.headers.get("content-type", ""):
+                raise ValueError(f"Invalid query. API error: {response.text.strip()}")
+
+            return load_json(response.content, self.max_depth_json_parsing)
+
+        return self._retry_with_logging(_do_query)
 
     async def aarticle_search(self, filters: Filters) -> pd.DataFrame:
         """Async version of article_search."""
@@ -238,25 +332,29 @@ class GdeltClient:
 
     async def _aquery(self, mode: str | Mode, query_string: str) -> dict:
         """Execute a DOC API query (async)."""
-        if self.aio_session is None:
-            self.aio_session = ClientSession(headers=self.default_headers)
 
-        response = await self.aio_session.get(f"{self.DOC_API_URL}?query={query_string}&mode={mode}&format=json")
+        async def _do_aquery():
+            if self.aio_session is None:
+                self.aio_session = ClientSession(headers=self.default_headers)
 
-        raise_response_error(response=response)
+            response = await self.aio_session.get(f"{self.DOC_API_URL}?query={query_string}&mode={mode}&format=json")
 
-        content_type = response.headers.get("content-type", "")
-        if "text/html" in content_type:
-            text = await response.text()
-            raise ValueError(f"Invalid query. API error: {text.strip()}")
+            raise_response_error(response=response)
 
-        try:
-            data = await response.read()
-            return load_json(data, self.max_depth_json_parsing)
-        except ValueError as e:
-            raise ValueError("Failed to parse JSON response from API") from e
-        finally:
-            response.release()
+            content_type = response.headers.get("content-type", "")
+            if "text/html" in content_type:
+                text = await response.text()
+                raise ValueError(f"Invalid query. API error: {text.strip()}")
+
+            try:
+                data = await response.read()
+                return load_json(data, self.max_depth_json_parsing)
+            except ValueError as e:
+                raise ValueError("Failed to parse JSON response from API") from e
+            finally:
+                response.release()
+
+        return await self._aretry_with_logging(_do_aquery)
 
     def search(
         self,
@@ -434,20 +532,29 @@ class GdeltClient:
         columns: list[str],
     ) -> pd.DataFrame | None:
         """Download and parse a single GDELT data file (sync)."""
-        if self.session is None:
-            self.session = Session()
-            self.session.headers.update(self.default_headers)
 
-        try:
+        def _do_download():
+            if self.session is None:
+                self.session = Session()
+                self.session.headers.update(self.default_headers)
+
             response = self.session.get(url, timeout=self.download_timeout)
 
             if response.status_code == 404:
                 warnings.warn(f"No data available for URL: {url}", stacklevel=2)
                 return None
 
+            # This will raise RateLimitError or ServerError which will trigger retries
+            raise_response_error(response=response)
             response.raise_for_status()
             return self._parse_gdelt_file(response.content, table, columns)
 
+        try:
+            return self._retry_with_logging(_do_download)
+        except (RateLimitError, ServerError) as e:
+            error_msg = str(e) if str(e) else f"{type(e).__name__}"
+            warnings.warn(f"Failed to download {url} after retries: {error_msg}", stacklevel=2)
+            return None
         except Exception as e:
             error_msg = str(e) if str(e) else f"{type(e).__name__}"
             warnings.warn(f"Failed to download {url}: {error_msg}", stacklevel=2)
@@ -460,19 +567,28 @@ class GdeltClient:
         columns: list[str],
     ) -> pd.DataFrame | None:
         """Download and parse a single GDELT data file (async)."""
-        if self.aio_session is None:
-            self.aio_session = ClientSession(headers=self.default_headers)
 
-        try:
+        async def _do_adownload():
+            if self.aio_session is None:
+                self.aio_session = ClientSession(headers=self.default_headers)
+
             async with self.aio_session.get(url, timeout=ClientTimeout(total=self.download_timeout)) as response:
                 if response.status == 404:
                     warnings.warn(f"No data available for URL: {url}", stacklevel=2)
                     return None
 
+                # This will raise RateLimitError or ServerError which will trigger retries
+                raise_response_error(response=response)
                 response.raise_for_status()
                 content = await response.read()
                 return self._parse_gdelt_file(content, table, columns)
 
+        try:
+            return await self._aretry_with_logging(_do_adownload)
+        except (RateLimitError, ServerError) as e:
+            error_msg = str(e) if str(e) else f"{type(e).__name__}"
+            warnings.warn(f"Failed to download {url} after retries: {error_msg}", stacklevel=2)
+            return None
         except Exception as e:
             error_msg = str(e) if str(e) else f"{type(e).__name__}"
             warnings.warn(f"Failed to download {url}: {error_msg}", stacklevel=2)
