@@ -22,13 +22,10 @@ class TestArticleSearchAsync:
         end_date = (datetime.today() - timedelta(days=6)).strftime("%Y-%m-%d")
 
         f = Filters(keyword="environment", start_date=start_date, end_date=end_date)
-        session = ClientSession()
-        client = GdeltClient(aio_session=session)
-        articles = await client.aarticle_search(f)
+        async with GdeltClient() as client:
+            articles = await client.aarticle_search(f)
 
         assert type(articles) is pd.DataFrame
-
-        await session.close()
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -37,9 +34,8 @@ class TestArticleSearchAsync:
         end_date = (datetime.today() - timedelta(days=6)).strftime("%Y-%m-%d")
 
         f = Filters(keyword="environment", start_date=start_date, end_date=end_date)
-        session = ClientSession()
-        client = GdeltClient(aio_session=session)
-        articles = await client.aarticle_search(f)
+        async with GdeltClient() as client:
+            articles = await client.aarticle_search(f)
 
         assert list(articles.columns) == [
             "url",
@@ -52,8 +48,6 @@ class TestArticleSearchAsync:
             "sourcecountry",
         ]
 
-        await session.close()
-
     @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_rows_returned(self):
@@ -64,13 +58,10 @@ class TestArticleSearchAsync:
         end_date = (datetime.today() - timedelta(days=6)).strftime("%Y-%m-%d")
 
         f = Filters(keyword="environment", start_date=start_date, end_date=end_date)
-        session = ClientSession()
-        client = GdeltClient(aio_session=session)
-        articles = await client.aarticle_search(f)
+        async with GdeltClient() as client:
+            articles = await client.aarticle_search(f)
 
         assert articles.shape[0] >= 1
-
-        await session.close()
 
 
 class TestTimelineSearchAsync:
@@ -86,22 +77,19 @@ class TestTimelineSearchAsync:
 
         f = Filters(keyword="environment", start_date=start_date, end_date=end_date)
 
-        session = ClientSession()
-        gd = GdeltClient(aio_session=session)
-        all_results = []
-        for mode in [
-            "timelinevol",
-            "timelinevolraw",
-            "timelinelang",
-            "timelinetone",
-            "timelinesourcecountry",
-        ]:
-            result = await gd.atimeline_search(mode, f)
-            all_results.append(result)
+        async with GdeltClient() as gd:
+            all_results = []
+            for mode in [
+                "timelinevol",
+                "timelinevolraw",
+                "timelinelang",
+                "timelinetone",
+                "timelinesourcecountry",
+            ]:
+                result = await gd.atimeline_search(mode, f)
+                all_results.append(result)
 
         assert all(type(result) is pd.DataFrame for result in all_results)
-
-        await session.close()
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -111,22 +99,19 @@ class TestTimelineSearchAsync:
 
         f = Filters(keyword="environment", start_date=start_date, end_date=end_date)
 
-        session = ClientSession()
-        gd = GdeltClient(aio_session=session)
-        all_results = []
-        for mode in [
-            "timelinevol",
-            "timelinevolraw",
-            "timelinelang",
-            "timelinetone",
-            "timelinesourcecountry",
-        ]:
-            result = await gd.atimeline_search(mode, f)
-            all_results.append(result)
+        async with GdeltClient() as gd:
+            all_results = []
+            for mode in [
+                "timelinevol",
+                "timelinevolraw",
+                "timelinelang",
+                "timelinetone",
+                "timelinesourcecountry",
+            ]:
+                result = await gd.atimeline_search(mode, f)
+                all_results.append(result)
 
         assert all(result.shape[0] >= 1 for result in all_results)
-
-        await session.close()
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -135,9 +120,7 @@ class TestTimelineSearchAsync:
         end_date = (datetime.today() - timedelta(days=6)).strftime("%Y-%m-%d")
 
         with pytest.raises(ValueError, match="Invalid"):
-            session = ClientSession()
-            gd = GdeltClient(aio_session=session)
-            try:
+            async with GdeltClient() as gd:
                 await gd.atimeline_search(
                     "unsupported",
                     Filters(
@@ -146,8 +129,6 @@ class TestTimelineSearchAsync:
                         end_date=end_date,
                     ),
                 )
-            finally:
-                await session.close()
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -157,13 +138,10 @@ class TestTimelineSearchAsync:
 
         f = Filters(keyword="environment", start_date=start_date, end_date=end_date)
 
-        session = ClientSession()
-        gd = GdeltClient(aio_session=session)
-        result = await gd.atimeline_search("timelinevol", f)
+        async with GdeltClient() as gd:
+            result = await gd.atimeline_search("timelinevol", f)
 
         assert result.shape[1] == 2
-
-        await session.close()
 
     @pytest.mark.integration
     @pytest.mark.asyncio
@@ -173,56 +151,43 @@ class TestTimelineSearchAsync:
 
         f = Filters(keyword="environment", start_date=start_date, end_date=end_date)
 
-        session = ClientSession()
-        gd = GdeltClient(aio_session=session)
-        result = await gd.atimeline_search("timelinevolraw", f)
+        async with GdeltClient() as gd:
+            result = await gd.atimeline_search("timelinevolraw", f)
 
         assert result.shape[1] == 3
 
-        await session.close()
-
     @pytest.mark.asyncio
     async def test_handles_empty_API_response(self):
-        session = ClientSession()
-        gd = GdeltClient(aio_session=session)
-
-        with mock.patch.object(gd, "_aquery", new_callable=mock.AsyncMock) as query_mock:
-            query_mock.return_value = {}
-            result = await gd.atimeline_search("timelinetone", Filters(keyword="environment", timespan="1h"))
-            assert type(result) is pd.DataFrame
-            assert result.shape[0] == 0
-
-        await session.close()
+        async with GdeltClient() as gd:
+            with mock.patch.object(gd, "_aquery", new_callable=mock.AsyncMock) as query_mock:
+                query_mock.return_value = {}
+                result = await gd.atimeline_search("timelinetone", Filters(keyword="environment", timespan="1h"))
+                assert type(result) is pd.DataFrame
+                assert result.shape[0] == 0
 
 
 class TestQueryAsync:
     @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_handles_invalid_query_string(self):
-        session = ClientSession()
-        gd = GdeltClient(aio_session=session)
-
-        with pytest.raises(ValueError, match=r"Invalid query"):
-            await gd._aquery("artlist", "environment&timespan=mins15")
-
-        await session.close()
+        async with GdeltClient() as gd:
+            with pytest.raises(ValueError, match=r"Invalid query"):
+                await gd._aquery("artlist", "environment&timespan=mins15")
 
     @pytest.mark.asyncio
     async def test_raises_an_error_when_response_is_bad_status_code(self):
-        session = ClientSession()
-        gd = GdeltClient(aio_session=session)
+        async with ClientSession() as session:
+            gd = GdeltClient(aio_session=session)
 
-        mock_response = mock.AsyncMock()
-        mock_response.status = 429
-        mock_response.reason = "Too Many Requests"
-        mock_response.headers = {"content-type": "application/json"}
+            mock_response = mock.AsyncMock()
+            mock_response.status = 429
+            mock_response.reason = "Too Many Requests"
+            mock_response.headers = {"content-type": "application/json"}
 
-        with mock.patch.object(session, "get", new_callable=mock.AsyncMock) as mock_get:
-            mock_get.return_value = mock_response
-            with pytest.raises(RateLimitError):
-                await gd._aquery("artlist", "")
-
-        await session.close()
+            with mock.patch.object(session, "get", new_callable=mock.AsyncMock) as mock_get:
+                mock_get.return_value = mock_response
+                with pytest.raises(RateLimitError):
+                    await gd._aquery("artlist", "")
 
 
 class TestArticleSearchSync:

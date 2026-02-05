@@ -8,7 +8,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING
 
 import pandas as pd
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 from requests import Session
 
 from gdelt_client.enums import ArticleMode, GdeltTable, Mode, OutputFormat, TimeSeriesMode
@@ -85,7 +85,13 @@ class GdeltClient:
     >>> events = client.search("2024-01-15", table=GdeltTable.EVENTS)
     >>> mentions = client.search(["2024-01-15", "2024-01-16"], table=GdeltTable.MENTIONS, coverage=True)
 
-    Async usage:
+    Async usage with context manager (recommended):
+
+    >>> async with GdeltClient() as client:
+    ...     articles = await client.aarticle_search(filters)
+    ...     events = await client.asearch("2024-01-15", table=GdeltTable.EVENTS)
+
+    Async usage without context manager:
 
     >>> articles = await client.aarticle_search(filters)
     >>> events = await client.asearch("2024-01-15", table=GdeltTable.EVENTS)
@@ -100,6 +106,8 @@ class GdeltClient:
         session: Session | None = None,
         aio_session: ClientSession | None = None,
         max_workers: int | None = None,
+        download_timeout: int = 120,
+        max_concurrent_downloads: int = 20,
     ) -> None:
         """
         Initialize the GDELT client.
@@ -115,6 +123,12 @@ class GdeltClient:
         max_workers
             Maximum number of parallel workers for downloading files.
             Defaults to None (uses ThreadPoolExecutor default).
+        download_timeout
+            Timeout in seconds for downloading data files.
+            Defaults to 120 seconds. Increase if downloading many files concurrently.
+        max_concurrent_downloads
+            Maximum number of concurrent async downloads.
+            Defaults to 20 to prevent overwhelming the network.
         """
         self.max_depth_json_parsing = json_parsing_max_depth
         self.default_headers: dict[str, str] = {
@@ -123,7 +137,32 @@ class GdeltClient:
         self.session = session
         self.aio_session = aio_session
         self.max_workers = max_workers
+        self.download_timeout = download_timeout
+        self.max_concurrent_downloads = max_concurrent_downloads
         self._cameo_codes: pd.DataFrame | None = None
+        # Track if sessions were provided by user (so we don't close them)
+        self._user_provided_session = session is not None
+        self._user_provided_aio_session = aio_session is not None
+
+    def __enter__(self):
+        """Enter sync context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit sync context manager and cleanup resources."""
+        if not self._user_provided_session and self.session is not None:
+            self.session.close()
+        return False
+
+    async def __aenter__(self):
+        """Enter async context manager."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Exit async context manager and cleanup resources."""
+        if not self._user_provided_aio_session and self.aio_session is not None:
+            await self.aio_session.close()
+        return False
 
     @property
     def cameo_codes(self) -> pd.DataFrame:
@@ -319,7 +358,8 @@ class GdeltClient:
         if len(urls) == 1:
             results = await self._adownload_and_parse(urls[0], table_enum, columns)
         else:
-            tasks = [self._adownload_and_parse(url, table_enum, columns) for url in urls]
+            semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
+            tasks = [self._adownload_and_parse_with_semaphore(url, table_enum, columns, semaphore) for url in urls]
             dfs = await asyncio.gather(*tasks, return_exceptions=True)
 
             valid_dfs = [df for df in dfs if isinstance(df, pd.DataFrame) and not df.empty]
@@ -399,7 +439,7 @@ class GdeltClient:
             self.session.headers.update(self.default_headers)
 
         try:
-            response = self.session.get(url, timeout=30)
+            response = self.session.get(url, timeout=self.download_timeout)
 
             if response.status_code == 404:
                 warnings.warn(f"No data available for URL: {url}", stacklevel=2)
@@ -409,7 +449,8 @@ class GdeltClient:
             return self._parse_gdelt_file(response.content, table, columns)
 
         except Exception as e:
-            warnings.warn(f"Failed to download {url}: {e}", stacklevel=2)
+            error_msg = str(e) if str(e) else f"{type(e).__name__}"
+            warnings.warn(f"Failed to download {url}: {error_msg}", stacklevel=2)
             return None
 
     async def _adownload_and_parse(
@@ -423,7 +464,7 @@ class GdeltClient:
             self.aio_session = ClientSession(headers=self.default_headers)
 
         try:
-            async with self.aio_session.get(url, timeout=30) as response:
+            async with self.aio_session.get(url, timeout=ClientTimeout(total=self.download_timeout)) as response:
                 if response.status == 404:
                     warnings.warn(f"No data available for URL: {url}", stacklevel=2)
                     return None
@@ -433,8 +474,20 @@ class GdeltClient:
                 return self._parse_gdelt_file(content, table, columns)
 
         except Exception as e:
-            warnings.warn(f"Failed to download {url}: {e}", stacklevel=2)
+            error_msg = str(e) if str(e) else f"{type(e).__name__}"
+            warnings.warn(f"Failed to download {url}: {error_msg}", stacklevel=2)
             return None
+
+    async def _adownload_and_parse_with_semaphore(
+        self,
+        url: str,
+        table: GdeltTable,
+        columns: list[str],
+        semaphore: asyncio.Semaphore,
+    ) -> pd.DataFrame | None:
+        """Download and parse a single GDELT data file with semaphore control."""
+        async with semaphore:
+            return await self._adownload_and_parse(url, table, columns)
 
     def _parse_gdelt_file(
         self,
@@ -449,14 +502,15 @@ class GdeltClient:
         if table == GdeltTable.EVENTS:
             dtype_overrides = {26: "str", 27: "str", 28: "str"}
 
-        df = pd.read_csv(
+        df = pd.read_csv(  # type: ignore[call-overload]
             buffer,
             compression="zip",
             sep="\t",
             header=None,
             on_bad_lines="skip",
-            dtype=dtype_overrides,
+            dtype=dtype_overrides,  # type: ignore[arg-type]
             low_memory=False,
+            encoding="latin-1",
         )
 
         if len(df.columns) == len(columns):
@@ -480,8 +534,8 @@ class GdeltClient:
         codes_df = self.cameo_codes
         descriptions = df["EventCode"].apply(lambda x: get_cameo_description(str(x), codes_df))
 
-        insert_idx = df.columns.get_loc("EventCode") + 1
-        df.insert(insert_idx, "CAMEOCodeDescription", descriptions)
+        insert_idx = df.columns.get_loc("EventCode") + 1  # type: ignore[operator]
+        df.insert(insert_idx, "CAMEOCodeDescription", descriptions)  # type: ignore[arg-type]
 
         return df
 
@@ -529,10 +583,7 @@ class GdeltClient:
 
         filtered = df[df[lat_col].notna() & df[lon_col].notna()].copy()
 
-        geometry = [
-            Point(lon, lat) if pd.notna(lon) and pd.notna(lat) else None
-            for lon, lat in zip(filtered[lon_col], filtered[lat_col], strict=False)
-        ]
+        geometry = [Point(lon, lat) for lon, lat in zip(filtered[lon_col], filtered[lat_col], strict=False)]
 
         gdf = gpd_module.GeoDataFrame(filtered, geometry=geometry, crs="EPSG:4326")
         gdf.columns = pd.Index([col.replace("_", "").lower() for col in gdf.columns])
