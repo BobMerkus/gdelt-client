@@ -22,3 +22,16 @@ class HttpResponseCodes(Enum):
     BAD_REQUEST = 400
     NOT_FOUND = 404
     RATE_LIMIT = 429
+
+
+class GdeltTable(StrEnum):
+    EVENTS = "events"
+    MENTIONS = "mentions"
+    GKG = "gkg"
+
+
+class OutputFormat(StrEnum):
+    DATAFRAME = "df"
+    JSON = "json"
+    CSV = "csv"
+    GEODATAFRAME = "gpd"

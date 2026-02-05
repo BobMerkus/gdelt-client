@@ -2,29 +2,31 @@
 
 A Python client to fetch data from the [GDELT 2.0 API](https://gdeltproject.org/).
 
-This allows for simpler, small-scale analysis of news coverage without having to deal with the complexities of downloading and managing the raw files from S3, or working with the BigQuery export.
+This client supports both the DOC API for article search and timelines, as well as direct access to GDELT's raw event data files (events, mentions, and GKG). This allows for simpler, small-scale analysis of news coverage and events data without having to deal with the complexities of downloading and managing the raw files from S3, or working with the BigQuery export.
 
 The implementation has been forked from [gdeltdoc](https://github.com/alex9smith/gdelt-doc-api).
 
 ## Installation
 
-`gdeltdoc` is on PyPi and is installed through pip:
+`gdelt-client` is on [PyPi](https://pypi.org/project/gdelt-client/) and is installed through pip:
 
 ```bash
-pip install gdeltdoc
+pip install gdelt-client
 ```
 
 ## Use
 
-The `ArtList` and `Timeline*` query modes are supported.
+### DOC API - Article Search & Timelines
+
+Search for news articles and get timeline data via the GDELT DOC API.
 
 ```python
-from gdeltdoc import GdeltClient, Filters
+from gdelt_client import GdeltClient, Filters
 
 f = Filters(
-    keyword = "climate change",
-    start_date = "2020-05-10",
-    end_date = "2020-05-11"
+    keyword="climate change",
+    start_date="2020-05-10",
+    end_date="2020-05-11"
 )
 
 gd = GdeltClient()
@@ -32,30 +34,109 @@ gd = GdeltClient()
 # Search for articles matching the filters
 articles = gd.article_search(f)
 
-# Get a timeline of the number of articles matching the filters
+# Get a timeline of coverage volume
 timeline = gd.timeline_search("timelinevol", f)
 ```
 
+**Async example:**
+
+```python
+import asyncio
+from gdelt_client import GdeltClient, Filters
+
+async def main():
+    f = Filters(keyword="climate change", start_date="2020-05-10", end_date="2020-05-11")
+
+    # Use async context manager to properly cleanup resources
+    async with GdeltClient() as gd:
+        # Async article search
+        articles = await gd.aarticle_search(f)
+
+        # Async timeline search
+        timeline = await gd.atimeline_search("timelinevol", f)
+
+asyncio.run(main())
+```
+
+### Raw Data Downloads - Events, Mentions & GKG
+
+Download and parse GDELT's raw data files directly. Returns data with CAMEO code descriptions for events.
+
+```python
+from gdelt_client import GdeltClient, GdeltTable, OutputFormat
+
+gd = GdeltClient()
+
+# Download events for a single date
+events = gd.search(
+    date="2020-05-10",
+    table=GdeltTable.EVENTS,
+    output=OutputFormat.DATAFRAME
+)
+
+# Download mentions for a date range with full 15-min coverage
+mentions = gd.search(
+    date=["2020-05-10", "2020-05-11"],
+    table=GdeltTable.MENTIONS,
+    coverage=True  # Download all 15-minute intervals
+)
+
+# Get GeoDataFrame with geometry for mapping
+geo_events = gd.search(
+    date="2020-05-10",
+    table=GdeltTable.EVENTS,
+    output=OutputFormat.GEODATAFRAME
+)
+
+# View table schema
+schema = gd.schema(GdeltTable.EVENTS)
+```
+
+**Async example** (downloads files concurrently for better performance):
+
+```python
+import asyncio
+from gdelt_client import GdeltClient, GdeltTable
+
+async def main():
+    # Use async context manager to properly cleanup resources
+    async with GdeltClient() as gd:
+        # Async search with concurrent file downloads
+        events = await gd.asearch(
+            date=["2020-05-10", "2020-05-11"],
+            table=GdeltTable.EVENTS,
+            coverage=True
+        )
+    print(events[:5])
+    print(f"Total records {len(events)}")
+asyncio.run(main())
+```
+
+**Available tables:** `EVENTS`, `MENTIONS`, `GKG`  
+**Available output formats:** `DATAFRAME`, `JSON`, `CSV`, `GEODATAFRAME`
+
 ### Article List
 
-The article list mode of the API generates a list of news articles that match the filters. The client returns this as a pandas DataFrame with columns `url`, `url_mobile`, `title`, `seendate`, `socialimage`, `domain`, `language`, `sourcecountry`.
+The `article_search()` method (and async `aarticle_search()`) generates a list of news articles that match the filters. Returns a pandas DataFrame with columns: `url`, `url_mobile`, `title`, `seendate`, `socialimage`, `domain`, `language`, `sourcecountry`.
 
 ### Timeline Search
 
-There are 5 available modes when making a timeline search:
+The `timeline_search()` method (and async `atimeline_search()`) supports 5 modes:
 
-- `timelinevol` - a timeline of the volume of news coverage matching the filters, represented as a percentage of the total news articles monitored by GDELT.
-- `timelinevolraw` - similar to `timelinevol`, but has the actual number of articles and a total rather than a percentage
-- `timelinelang` - similar to `timelinevol` but breaks the total articles down by published language. Each language is returned as a separate column in the DataFrame.
-- `timelinesourcecountry` - similar to `timelinevol` but breaks the total articles down by the country they were published in. Each country is returned as a separate column in the DataFrame.
-- `timelinetone` - a timeline of the average tone of the news coverage matching the filters. See [GDELT's documentation](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) for more information about the tone metric.
+- `timelinevol` - Timeline of coverage volume as a percentage of all monitored articles
+- `timelinevolraw` - Timeline with actual article counts instead of percentages
+- `timelinelang` - Coverage broken down by language (each language as a column)
+- `timelinesourcecountry` - Coverage broken down by source country (each country as a column)
+- `timelinetone` - Average tone of articles over time (see [GDELT docs](https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/) for tone metric details)
+
+All modes return a pandas DataFrame with a `datetime` column and data columns.
 
 ### Filters
 
-The search query passed to the API is constructed from a `gdeltdoc.Filters` object.
+The search query passed to the API is constructed from a `gdelt_client.Filters` object.
 
 ```python
-from gdeltdoc import Filters, near, repeat
+from gdelt_client import Filters, near, repeat
 
 f = Filters(
     start_date = "2020-05-01",
@@ -89,6 +170,10 @@ You must pass either `start_date` and `end_date`, or `timespan`
 - `repeat` - Return articles containing a single word repeated at least a number of times. Use `repeat()` to construct. eg. `repeat =repeat(3, "environment")`, or `multi_repeat()` if you want to use multiple restrictions eg. `repeat = multi_repeat([(2, "airline"), (3, "airport")], "AND")`
 - `tone` - Return articles above or below a particular tone score (ie more positive or more negative than a certain threshold). To use, specify either a greater than or less than sign and a positive or negative number (either an integer or floating point number). To find fairly positive articles, use `tone=">5"` or to search for fairly negative articles, use `tone="<-5"`
 - tone_absolute - The same as `tone` but ignores the positive/negative sign and lets you search for high emotion or low emotion articles, regardless of whether they were happy or sad in tone
+
+## Attribution
+
+The JSON schema data files in this package (`src/gdelt_client/data/schemas/`) are based on schemas from [gdeltPyR](https://github.com/linwoodc3/gdeltPyR), which is licensed under the GNU General Public License v3.0.
 
 ## Developing gdelt-client
 
