@@ -10,7 +10,7 @@ on:
 
 jobs:
   unit-test:
-    name: python
+    name: unit-test
     runs-on: ubuntu-latest
     strategy:
       matrix:
