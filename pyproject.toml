@@ -4,7 +4,7 @@ version = "0.1.0"
 description="A client for the GDELT 2.0 API"
 readme = "README.md"
 authors = [
-    { name = "Bob Merkus", email = "bob.merkus@gmail.com" }
+    { name = "Bob Merkus", email = "23738320+BobMerkus@users.noreply.github.com" }
 ]
 requires-python = ">=3.11"
 dependencies = [
