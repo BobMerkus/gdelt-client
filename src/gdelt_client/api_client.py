@@ -626,7 +626,11 @@ class GdeltClient:
             on_bad_lines="skip",
             dtype=dtype_overrides,  # type: ignore[arg-type]
             low_memory=False,
-            encoding="latin-1",
+            # GDELT files are UTF-8. Reading them as Latin-1 turned every non-ASCII
+            # character into two ("São Paulo" -> "SÃ£o Paulo"); "replace" keeps the
+            # old guarantee that a malformed byte never fails the whole file.
+            encoding="utf-8",
+            encoding_errors="replace",
         )
 
         if len(df.columns) == len(columns):

@@ -909,6 +909,35 @@ class TestParseGdeltFile:
         with pytest.warns(UserWarning, match="Column count mismatch"):
             client._parse_gdelt_file(buffer.read(), GdeltTable.MENTIONS, columns)
 
+    def test_decodes_utf8(self):
+        """Bytes copied from a GDELT export; read as Latin-1 they became "Ã\x8ee-de-France"."""
+        import io
+        import zipfile
+
+        from gdelt_client.enums import GdeltTable
+
+        client = GdeltClient()
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("data.csv", b"Versailles, \xc3\x8ee-de-France, France\tGeneva, Gen\xc3\xa8, Switzerland\n")
+        result = client._parse_gdelt_file(buffer.getvalue(), GdeltTable.MENTIONS, ["A", "B"])
+
+        assert result.iloc[0].tolist() == ["Versailles, Îe-de-France, France", "Geneva, Genè, Switzerland"]
+
+    def test_malformed_bytes_do_not_fail_the_file(self):
+        import io
+        import zipfile
+
+        from gdelt_client.enums import GdeltTable
+
+        client = GdeltClient()
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("data.csv", b"bad \xff byte\tok\n")
+        result = client._parse_gdelt_file(buffer.getvalue(), GdeltTable.MENTIONS, ["A", "B"])
+
+        assert result.iloc[0].tolist() == ["bad \ufffd byte", "ok"]
+
     def test_uses_dtype_overrides_for_events(self):
         import io
         import zipfile
